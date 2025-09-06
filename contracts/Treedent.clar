@@ -15,10 +15,14 @@
 (define-constant err-milestone-already-claimed (err u113))
 (define-constant err-tree-not-adopted (err u114))
 (define-constant err-invalid-milestone (err u115))
+(define-constant err-not-authorized-monitor (err u116))
+(define-constant err-invalid-health-status (err u117))
+(define-constant err-monitoring-too-frequent (err u118))
 
 (define-data-var next-tree-id uint u1)
 (define-data-var next-order-id uint u1)
 (define-data-var next-adoption-id uint u1)
+(define-data-var next-monitoring-id uint u1)
 
 (define-map trees 
     uint 
@@ -94,6 +98,35 @@
 (define-map tree-to-adoption
     uint
     uint
+)
+
+;; Tree monitoring maps
+(define-map tree-monitoring-entries
+    uint
+    {
+        tree-id: uint,
+        reporter: principal,
+        health-status: uint,
+        height-cm: uint,
+        diameter-mm: uint,
+        notes: (string-ascii 128),
+        timestamp: uint,
+        entry-id: uint
+    }
+)
+
+(define-map tree-monitoring-count
+    uint
+    uint
+)
+
+(define-map tree-latest-monitoring
+    uint
+    {
+        last-entry-id: uint,
+        last-update: uint,
+        current-health: uint
+    }
 )
 
 (define-read-only (get-tree-details (tree-id uint))
@@ -494,6 +527,143 @@
         (asserts! (get active adoption-data) err-tree-not-adopted)
         
         (ok health-report)
+    )
+)
+
+;; Tree monitoring functions
+(define-public (add-monitoring-entry (tree-id uint) (health-status uint) (height-cm uint) (diameter-mm uint) (notes (string-ascii 128)))
+    (let
+        (
+            (tree-data (unwrap! (map-get? trees tree-id) err-not-found))
+            (monitoring-id (var-get next-monitoring-id))
+            (current-monitoring (map-get? tree-latest-monitoring tree-id))
+            (monitoring-count (default-to u0 (map-get? tree-monitoring-count tree-id)))
+            (current-block stacks-block-height)
+        )
+        ;; Validate inputs
+        (asserts! (get verified tree-data) err-not-found)
+        (asserts! (and (>= health-status u1) (<= health-status u5)) err-invalid-health-status)
+        
+        ;; Check authorization: verifiers or sponsors can monitor
+        (asserts! (or (is-verifier tx-sender) (is-authorized-sponsor tree-id tx-sender)) err-not-authorized-monitor)
+        
+        ;; Prevent too frequent monitoring (minimum 72 blocks / ~12 hours)
+        (match current-monitoring
+            latest-data
+                (asserts! (>= (- current-block (get last-update latest-data)) u72) err-monitoring-too-frequent)
+            true
+        )
+        
+        ;; Create monitoring entry
+        (map-set tree-monitoring-entries monitoring-id {
+            tree-id: tree-id,
+            reporter: tx-sender,
+            health-status: health-status,
+            height-cm: height-cm,
+            diameter-mm: diameter-mm,
+            notes: notes,
+            timestamp: current-block,
+            entry-id: monitoring-id
+        })
+        
+        ;; Update monitoring counters and latest status
+        (map-set tree-monitoring-count tree-id (+ monitoring-count u1))
+        (map-set tree-latest-monitoring tree-id {
+            last-entry-id: monitoring-id,
+            last-update: current-block,
+            current-health: health-status
+        })
+        
+        (var-set next-monitoring-id (+ monitoring-id u1))
+        (ok monitoring-id)
+    )
+)
+
+;; Helper function to check if user is authorized sponsor for tree
+(define-private (is-authorized-sponsor (tree-id uint) (user principal))
+    (match (map-get? tree-to-adoption tree-id)
+        adoption-id
+            (match (map-get? tree-adoptions adoption-id)
+                adoption-data
+                    (and (is-eq (get sponsor adoption-data) user) (get active adoption-data))
+                false
+            )
+        false
+    )
+)
+
+;; Tree monitoring read-only functions
+(define-read-only (get-monitoring-entry (entry-id uint))
+    (map-get? tree-monitoring-entries entry-id)
+)
+
+(define-read-only (get-tree-latest-monitoring (tree-id uint))
+    (map-get? tree-latest-monitoring tree-id)
+)
+
+(define-read-only (get-tree-monitoring-count (tree-id uint))
+    (default-to u0 (map-get? tree-monitoring-count tree-id))
+)
+
+(define-read-only (get-tree-health-status (tree-id uint))
+    (match (map-get? tree-latest-monitoring tree-id)
+        monitoring-data (get current-health monitoring-data)
+        u0
+    )
+)
+
+;; Calculate tree growth metrics from first and latest monitoring
+(define-read-only (calculate-tree-growth (tree-id uint))
+    (let
+        (
+            (latest-monitoring (map-get? tree-latest-monitoring tree-id))
+            (monitoring-count (get-tree-monitoring-count tree-id))
+        )
+        (if (> monitoring-count u1)
+            (match latest-monitoring
+                latest-data
+                    (match (map-get? tree-monitoring-entries (get last-entry-id latest-data))
+                        current-entry
+                            {
+                                has-growth-data: true,
+                                current-height: (get height-cm current-entry),
+                                current-diameter: (get diameter-mm current-entry),
+                                monitoring-count: monitoring-count,
+                                health-status: (get current-health latest-data)
+                            }
+                        {
+                            has-growth-data: false,
+                            current-height: u0,
+                            current-diameter: u0,
+                            monitoring-count: monitoring-count,
+                            health-status: u0
+                        }
+                    )
+                {
+                    has-growth-data: false,
+                    current-height: u0,
+                    current-diameter: u0,
+                    monitoring-count: u0,
+                    health-status: u0
+                }
+            )
+            {
+                has-growth-data: false,
+                current-height: u0,
+                current-diameter: u0,
+                monitoring-count: monitoring-count,
+                health-status: u0
+            }
+        )
+    )
+)
+
+(define-read-only (is-tree-healthy (tree-id uint))
+    (let
+        (
+            (health-status (get-tree-health-status tree-id))
+        )
+        (and (> health-status u0) (>= health-status u3))
     )
 )
 
